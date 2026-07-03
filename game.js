@@ -2458,6 +2458,85 @@ function beep(freq, dur, type, vol) {
   } catch (e) { }
 }
 
+/* ----------------------------------------------------------- menu music -- */
+let menuMusic = null;
+let _musicFade = null;       // requestAnimationFrame id do fade atual
+const MUSIC_MAX = 0.10;      // volume máximo (10%)
+
+function initMenuMusic() {
+  if (menuMusic) return;
+  try {
+    menuMusic = new Audio('assets/main.mp3');
+    menuMusic.loop = true;
+    menuMusic.volume = 0;
+  } catch(e) {}
+}
+
+/* faz fade do volume atual até |target| (0..1). Se target=0, pausa ao final. */
+function _fadeMusicTo(target, done) {
+  if (!menuMusic) return;
+  if (_musicFade) { cancelAnimationFrame(_musicFade); _musicFade = null; }
+  const start = menuMusic.volume;
+  const d = 700; // ms do fade
+  const t0 = performance.now();
+  function step(now) {
+    const p = Math.min(1, (now - t0) / d);
+    // ease-in-out suave
+    const e = p < 0.5 ? 2 * p * p : -1 + (4 - 2 * p) * p;
+    menuMusic.volume = start + (target - start) * e;
+    if (p < 1) { _musicFade = requestAnimationFrame(step); return; }
+    _musicFade = null;
+    menuMusic.volume = target;
+    if (target === 0) { menuMusic.pause(); menuMusic.currentTime = 0; }
+    if (done) done();
+  }
+  _musicFade = requestAnimationFrame(step);
+}
+
+function startMenuMusic() {
+  if (soundMuted || portalMuted) return;
+  try {
+    if (!menuMusic) initMenuMusic();
+    if (!menuMusic) return;
+    if (menuMusic.paused) {
+      menuMusic.volume = 0;
+      menuMusic.currentTime = 0;
+      // play() pode falhar por autoplay — o listener de primeiro toque resolve
+      menuMusic.play().then(() => { _fadeMusicTo(MUSIC_MAX); }).catch(() => {});
+    } else if (menuMusic.volume < MUSIC_MAX - 0.01) {
+      _fadeMusicTo(MUSIC_MAX);
+    }
+  } catch(e) {}
+}
+
+function stopMenuMusic() {
+  if (_musicFade) { cancelAnimationFrame(_musicFade); _musicFade = null; }
+  try {
+    if (menuMusic && !menuMusic.paused) _fadeMusicTo(0);
+  } catch(e) {}
+}
+
+/* autoplay: navegadores bloqueiam Audio.play() antes do primeiro gesto.
+   no primeiro clique/toque/tecla, se o menu estiver visivel, tenta de novo. */
+(function() {
+  function _tryMusic() {
+    const ov = document.getElementById('ui-start');
+    if (ov && ov.classList.contains('show')) startMenuMusic();
+  }
+  const opts = { once: true };
+  document.addEventListener('click',    _tryMusic, opts);
+  document.addEventListener('touchstart', _tryMusic, opts);
+  document.addEventListener('keydown',  _tryMusic, opts);
+})();
+
+/* -------------------------------------------------------- menu sfx -- */
+function menuClickSound() {
+  beep(660, 0.05, 'square', 0.035);
+}
+function menuHoverSound() {
+  beep(1100, 0.025, 'sine', 0.018);
+}
+
 /* ------------------------------------------------------------------- boot -- */
 let _menuMode = 'start'; // 'start' | 'resume'
 
@@ -2466,9 +2545,25 @@ function toggleSound() {
   document.querySelectorAll('.btn-sound,.mbsound').forEach(b => {
     b.innerHTML = soundMuted ? '🔇' : '🔊';
   });
+  // pausa/retoma música do menu conforme o mute
+  try {
+    if (menuMusic) {
+      if (soundMuted || portalMuted) {
+        if (_musicFade) { cancelAnimationFrame(_musicFade); _musicFade = null; }
+        menuMusic.volume = 0;
+        menuMusic.pause();
+      } else {
+        const startOv = document.getElementById('ui-start');
+        if (startOv && startOv.classList.contains('show')) {
+          startMenuMusic();
+        }
+      }
+    }
+  } catch(e) {}
 }
 
 function _animMenuOut(cb) {
+  stopMenuMusic();
   const ov = document.getElementById('ui-start');
   ov.classList.add('closing');
   stopSpiderCanvas();
@@ -2479,6 +2574,7 @@ function _animMenuIn() {
   ov.classList.remove('closing');
   ov.classList.add('show');
   setTimeout(initSpiderCanvas, 60); // wait for CSS transition to size the wrap
+  startMenuMusic();
 }
 
 function pauseGame() {
@@ -2768,7 +2864,21 @@ function renderUpgrades(id) {
 
 (async () => {
   await CG.init();          // inicializa o SDK (no-op fora do portal)
-  CG.initMute(m => { portalMuted = m; });   // respeita o mute do player do portal
+  CG.initMute(m => {
+    portalMuted = m;
+    // para/retoma música do menu quando o portal muda o mute
+    try {
+      if (menuMusic) {
+        if (m || soundMuted) {
+          if (_musicFade) { cancelAnimationFrame(_musicFade); _musicFade = null; }
+          menuMusic.volume = 0;
+          menuMusic.pause();
+        } else if (document.getElementById('ui-start').classList.contains('show')) {
+          startMenuMusic();
+        }
+      }
+    } catch(e) {}
+  });   // respeita o mute do player do portal
   LANG = detectLang();      // idioma pelo locale do portal / navegador / escolha salva
   metaLoad();               // sucata + upgrades permanentes (localStorage)
   localizeDefs();           // nomes+descrições de armas/passivas no idioma atual
@@ -2787,6 +2897,7 @@ function renderUpgrades(id) {
     initSpiderCanvas();
     CG.loadingStop();       // carregamento concluído — portal esconde o loader
     hideBootScreen();       // esconde nossa tela de loading (standalone/ngrok)
+    startMenuMusic();       // música de fundo do menu
     requestAnimationFrame(loop);
   }, setBootProgress);
 })();
@@ -2807,3 +2918,26 @@ document.getElementById('btnRestart').onclick    = () => {
   CG.requestAd('midgame', () => goMainMenu());
 };
 document.getElementById('btnRevive').onclick = revive;
+
+/* sons de clique/selecao nos botoes do menu (delegado) */
+(function() {
+  const startOv = document.getElementById('ui-start');
+  if (!startOv) return;
+  const SEL = '.mpbtn, .mbsound, .lang-btn, .btn, .upbuy, .mupgr-cell';
+
+  // click
+  startOv.addEventListener('click', (e) => {
+    if (e.target.closest(SEL)) menuClickSound();
+  });
+
+  // hover (mouseover bolha, delegamos no overlay)
+  let _hovered = null;
+  startOv.addEventListener('mouseover', (e) => {
+    const el = e.target.closest(SEL);
+    if (el && el !== _hovered) { _hovered = el; menuHoverSound(); }
+  });
+  startOv.addEventListener('mouseout', (e) => {
+    const el = e.target.closest(SEL);
+    if (el === _hovered) _hovered = null;
+  });
+})();
