@@ -259,9 +259,12 @@ const META_KEY = 'ss_meta';
 const START_COINS = 60;                         // sucata inicial (dá p/ 2 upgrades básicos)
 // tracks de upgrade por arma: nível máx, custos por nível, efeito por nível
 const WUP = {
+  // dano: linear (+15%/nv). Cadência buffada p/ +12% (paridade melhor com dano).
+  // Projéteis é de LONGE o mais forte (cada +1 ~dobra o DPS de armas de tiro único),
+  // então é o upgrade premium: bem mais caro e escalonado.
   dmg:   { key: 'up_dmg',   max: 5, cost: [30, 55, 95, 160, 260], per: 0.15, fmt: v => '+' + Math.round(v * 100) + '%' },
-  fire:  { key: 'up_fire',  max: 5, cost: [30, 55, 95, 160, 260], per: 0.10, fmt: v => '+' + Math.round(v * 100) + '%' },
-  count: { key: 'up_count', max: 3, cost: [70, 160, 340],         per: 1,    fmt: v => '+' + v },
+  fire:  { key: 'up_fire',  max: 5, cost: [30, 55, 95, 160, 260], per: 0.12, fmt: v => '+' + Math.round(v * 100) + '%' },
+  count: { key: 'up_count', max: 3, cost: [150, 400, 900],        per: 1,    fmt: v => '+' + v },
 };
 const WUP_ORDER = ['dmg', 'fire', 'count'];
 let META = { coins: 0, up: {} };
@@ -328,6 +331,7 @@ const I18N = {
     time_survived: 'Time Survived', kills: 'Kills',
     upgrades_hdr: 'UPGRADES', up_dmg: 'Damage', up_fire: 'Fire Rate', up_count: 'Projectiles',
     up_max: 'MAX', scrap_earned: '⚙ Scrap earned', locked_hint: 'Select a weapon to upgrade it',
+    all_maxed: '★ ALL MAXED! +{0} HP',
     prepare: 'Get ready...', wave: 'Wave {0}', lvl_short: 'Lv {0}', kills_count: '{0} Kills',
     pts: 'PTS', drone: 'DRONE', radar: 'RADAR',
     ready: '⚡ READY!', charge_short: '⚡ CHARGE', discharge: '⚡ DISCHARGE', low_hp: 'LOW HP! Kit in {0}s',
@@ -363,6 +367,7 @@ const I18N = {
     time_survived: 'Tempo Sobrevivido', kills: 'Abates',
     upgrades_hdr: 'MELHORIAS', up_dmg: 'Dano', up_fire: 'Cadência', up_count: 'Projéteis',
     up_max: 'MÁX', scrap_earned: '⚙ Sucata coletada', locked_hint: 'Selecione uma arma para melhorá-la',
+    all_maxed: '★ TUDO NO MÁXIMO! +{0} HP',
     prepare: 'Preparar...', wave: 'Onda {0}', lvl_short: 'Nv {0}', kills_count: '{0} Abates',
     pts: 'PTS', drone: 'DRONE', radar: 'RADAR',
     ready: '⚡ PRONTO!', charge_short: '⚡ CARGA', discharge: '⚡ DESCARGA', low_hp: 'VIDA BAIXA! Kit em {0}s',
@@ -620,7 +625,8 @@ function spawnEnemy(px, py, isBoss) {
   if (game.wave >= 6) pool.push(2, 3);
   const t = ETYPES[pool[(Math.random() * pool.length) | 0]];
   const bm = isBoss ? 5 : 1;                    // boss = 5× stats
-  const hp = Math.round(t.hp * (1 + (d - 1) * 0.5) * bm);
+  // HP escala com o tempo (d) E com a wave — acompanha o poder do jogador
+  const hp = Math.round(t.hp * (1 + (d - 1) * 0.7) * (1 + game.wave * 0.15) * bm);
   const sc = isBoss ? 1.8 : t.scale;
   game.enemies.push({
     x: px, y: py, t, hp, maxhp: hp, speed: t.speed * (isBoss ? 0.7 : (0.9 + Math.random() * 0.2)),
@@ -812,6 +818,11 @@ function fireWeapon(w) {
   beep(420 + lvl * 20, 0.03, 'square', 0.04);
 }
 
+/* aviso flutuante no centro (não pausa o jogo) */
+function showToast(text, color) {
+  game.toast = { text, color: color || '#ffd54a', life: 2.4, max: 2.4 };
+}
+
 /* --------------------------------------------------------------------- fx -- */
 function spawnFx(sheet, x, y, scale, rot, fs) {
   game.fx.push({ sheet, x, y, scale: scale || 1, rot: rot || 0, f: 0, ft: 0, fs: fs || 96 });
@@ -851,8 +862,22 @@ function openLevelUp() {
   showLevelUp();
 }
 function showLevelUp() {
-  game.paused = true;
   const choices = rewardPool();
+  if (choices.length === 0) {   // tudo no máximo: sem cards → cura + aviso claro (não trava)
+    const p = game.player;
+    const before = p.hp;
+    p.hp = Math.min(p.maxhp, p.hp + Math.round(p.maxhp * 0.12));
+    const healed = Math.round(p.hp - before);
+    showToast(t('all_maxed', healed), '#6ad06a');
+    spawnFx('boom', p.x, p.y, 1.4, 0);   // pulso verde de cura no player
+    beep(880, 0.06, 'sine', 0.05); beep(1100, 0.05, 'sine', 0.04);
+    pendingLevelUps = Math.max(0, pendingLevelUps - 1);
+    if (pendingLevelUps > 0) { showLevelUp(); return; }
+    game.paused = false;
+    CG.gameplayStart();
+    return;
+  }
+  game.paused = true;
   const box = document.getElementById('cards');
   box.innerHTML = '';
   choices.forEach(c => {
@@ -898,6 +923,7 @@ function update(dt) {
   const p = game.player;
   game.t += dt;
   if (game.shake > 0) game.shake = Math.max(0, game.shake - dt * 60);
+  if (game.toast) { game.toast.life -= dt; if (game.toast.life <= 0) game.toast = null; }
 
   /* --- player move --- */
   let mx = 0, my = 0;
@@ -948,7 +974,9 @@ function update(dt) {
     if (fp.life <= 0) game.footprints.splice(i, 1);
   }
 
-  /* --- overcharge --- */
+  /* --- overcharge: carrega por TEMPO (não por kills) --- */
+  const OC_RECHARGE = 14;   // segundos para encher a descarga
+  if (!p.dead && p.overcharge < p.ocMax) p.overcharge = Math.min(p.ocMax, p.overcharge + (p.ocMax / OC_RECHARGE) * dt);
   if (keys[' '] && p.overcharge >= p.ocMax) { overchargeBlast(); p.overcharge = 0; }
 
   /* --- camera --- */
@@ -1174,7 +1202,7 @@ function update(dt) {
 
   /* --- sub-acoplamento (drone de choque) --- */
   {
-    const newLvl = Math.floor(calcScore() / 2000);
+    const newLvl = Math.min(20, Math.floor(calcScore() / 2000));   // drone: nível máx = 20
     if (newLvl > game.orbLevel) {
       game.orbLevel = newLvl;
       game.orbLevelFlash = 1.2;
@@ -1256,7 +1284,6 @@ function damageEnemy(e, dmg) {
   if (e.hp <= 0 && !e.dying) {
     e.dying = true; e.dt = 0; e.anim = 0;
     game.kills++;
-    game.player.overcharge = Math.min(game.player.ocMax, game.player.overcharge + 2.2);
     if (Math.random() < 0.92) game.gems.push({ x: e.x, y: e.y, value: e.xpValue || e.t.xp, vac: false });
   }
 }
@@ -1786,9 +1813,10 @@ function drawHUD() {
     const cW = 54, cH = 76, cR = 6;
     const cX = scoreX, cY = scoreY - scorePH / 2 + scorePH + 4;
     const unlocked = game.orbLevel > 0;
-    const frac = unlocked
+    const maxed = game.orbLevel >= 20;
+    const frac = maxed ? 1 : (unlocked
       ? Math.min(1, (score - game.orbLevel * 2000) / 2000)
-      : Math.min(1, score / 2000);
+      : Math.min(1, score / 2000));
     const flash = game.orbLevelFlash || 0;
     const fp = flash > 0 ? Math.abs(Math.sin(flash * Math.PI * 7)) : 0;  // 0..1 pulsando
 
@@ -1838,7 +1866,7 @@ function drawHUD() {
     ctx.font = '600 6px "Press Start 2P", monospace';
     ctx.fillStyle = unlocked ? `rgba(255,${200 + fp * 55},80,1)` : 'rgba(140,120,170,.4)';
     ctx.textAlign = 'center';
-    ctx.fillText(unlocked ? `NV ${game.orbLevel}` : '? ? ?', cX + cW / 2, cY + cH - 4);
+    ctx.fillText(maxed ? 'MÁX' : (unlocked ? `NV ${game.orbLevel}` : '? ? ?'), cX + cW / 2, cY + cH - 4);
 
     ctx.restore();
 
@@ -2089,6 +2117,23 @@ function drawHUD() {
       ctx.beginPath(); ctx.arc(touch.ox + touch.dx * JOY_R, touch.oy + touch.dy * JOY_R, 18, 0, Math.PI * 2); ctx.fill();
       ctx.restore();
     }
+  }
+
+  /* === TOAST central (aviso não-bloqueante, ex.: tudo no máximo → cura) === */
+  if (game.toast) {
+    const tt = game.toast, k = tt.life / tt.max;              // 1 → 0
+    const a = k > 0.8 ? (1 - k) / 0.2 : Math.min(1, k / 0.35); // fade-in rápido, fade-out no fim
+    const rise = (1 - k) * 16;
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, Math.min(1, a));
+    ctx.font = '900 12px "Press Start 2P", monospace'; ctx.textAlign = 'center';
+    const tw = ctx.measureText(tt.text).width;
+    const bw = tw + 30, bh = 32, bx = W / 2 - bw / 2, by = H * 0.34 - rise;
+    ctx.fillStyle = 'rgba(14,8,20,.88)'; roundRect(bx, by, bw, bh, 9); ctx.fill();
+    ctx.strokeStyle = tt.color; ctx.lineWidth = 2; roundRect(bx, by, bw, bh, 9); ctx.stroke();
+    ctx.fillStyle = tt.color; ctx.fillText(tt.text, W / 2, by + bh / 2 + 4);
+    ctx.restore();
+    ctx.textAlign = 'left';
   }
 }
 function drawBossRadio() {
