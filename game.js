@@ -137,45 +137,54 @@ function drawImg(img, x, y, rot, scale, flip) {
   ctx.restore();
 }
 
-/* ------------------------------------------------------ CrazyGames SDK v3 -- */
-/* Wrapper seguro: se o SDK não existir (dev local, outro portal), tudo vira
-   no-op e os ads "passam direto" — o jogo nunca quebra fora do CrazyGames. */
-const CG = (() => {
-  const sdk = () => (window.CrazyGames && window.CrazyGames.SDK) || null;
-  let ready = false;      // init concluído com sucesso
+/* ------------------------------------------------ CrazyGames SDK v3 + Poki SDK -- */
+/* Wrapper seguro: detecta qual portal está presente (CrazyGames OU Poki) e fala
+   com o SDK certo; sem nenhum dos dois (dev local), tudo vira no-op e os ads
+   "passam direto" — o jogo nunca quebra fora de um portal. */
+const PORTAL = (() => {
+  const cg   = () => (window.CrazyGames && window.CrazyGames.SDK) || null;
+  const poki = () => window.PokiSDK || null;
+  let cgReady = false, pokiReady = false;   // init concluído com sucesso, por SDK
   let gpActive = false;   // gameplayStart em vigor (evita chamadas duplicadas)
   let adActive = false;   // um ad está tocando agora
 
   async function init() {
     // timeout evita tela travada se o SDK não responder (ex.: adblock, rede ruim)
-    try {
-      if (sdk()) {
-        await Promise.race([
-          sdk().init(),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000)),
-        ]);
-        ready = true;
-      }
-    } catch (e) { ready = false; console.warn('CG init falhou/timeout', e); }
+    const withTimeout = p => Promise.race([
+      p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000)),
+    ]);
+    await Promise.all([
+      (async () => {
+        try { if (cg()) { await withTimeout(cg().init()); cgReady = true; } }
+        catch (e) { cgReady = false; console.warn('PORTAL init (CrazyGames) falhou/timeout', e); }
+      })(),
+      (async () => {
+        try { if (poki()) { await withTimeout(poki().init()); pokiReady = true; } }
+        catch (e) { pokiReady = false; console.warn('PORTAL init (Poki) falhou/timeout', e); }
+      })(),
+    ]);
   }
-  const safe = fn => { try { if (ready) fn(sdk()); } catch (e) { /* silencioso */ } };
+  const safeCg   = fn => { try { if (cgReady) fn(cg()); } catch (e) { /* silencioso */ } };
+  const safePoki = fn => { try { if (pokiReady) fn(poki()); } catch (e) { /* silencioso */ } };
 
   return {
     init,
-    get available() { return ready; },
+    get available() { return cgReady || pokiReady; },
     get adPlaying() { return adActive; },
-    loadingStart() { safe(s => s.game.loadingStart()); },
-    loadingStop()  { safe(s => s.game.loadingStop()); },
-    happytime()    { safe(s => s.game.happytime()); },
-    gameplayStart() { if (gpActive) return; gpActive = true; safe(s => s.game.gameplayStart()); },
-    gameplayStop()  { if (!gpActive) return; gpActive = false; safe(s => s.game.gameplayStop()); },
+    loadingStart() { safeCg(s => s.game.loadingStart()); },   // Poki não tem "start", só o gameLoadingFinished abaixo
+    loadingStop()  { safeCg(s => s.game.loadingStop()); safePoki(s => s.gameLoadingFinished()); },
+    happytime()    { safeCg(s => s.game.happytime()); },      // sem equivalente documentado no Poki
+    gameplayStart() { if (gpActive) return; gpActive = true; safeCg(s => s.game.gameplayStart()); safePoki(s => s.gameplayStart()); },
+    gameplayStop()  { if (!gpActive) return; gpActive = false; safeCg(s => s.game.gameplayStop()); safePoki(s => s.gameplayStop()); },
 
     /* Respeita o mute do player do CrazyGames (settings.muteAudio). Aplica o
-       estado atual e escuta mudanças; tem prioridade sobre o mute in-game. */
+       estado atual e escuta mudanças; tem prioridade sobre o mute in-game.
+       (Poki não expõe um listener de mute global — só o mute manual durante ads,
+       já tratado em requestAd() abaixo.) */
     initMute(apply) {
-      if (!ready) return;
+      if (!cgReady) return;
       try {
-        const g = sdk().game;
+        const g = cg().game;
         const read = () => { try { return !!(g.settings && g.settings.muteAudio); } catch (e) { return false; } };
         apply(read());
         g.addSettingsChangeListener(s => apply(!!(s && s.muteAudio)));
@@ -184,47 +193,65 @@ const CG = (() => {
 
     /* Storage persistente: usa o SDK.data do CrazyGames (salva por usuário,
        sincroniza entre dispositivos) quando disponível; senão localStorage.
-       Escreve nos dois; na leitura prioriza o SDK.data. */
+       Escreve nos dois; na leitura prioriza o SDK.data.
+       (Poki sincroniza o próprio localStorage automaticamente para usuários
+       logados, então as mesmas chaves já funcionam sem chamada extra.) */
     get(key) {
-      try { if (ready && sdk().data) { const v = sdk().data.getItem(key); if (v != null) return v; } } catch (e) {}
+      try { if (cgReady && cg().data) { const v = cg().data.getItem(key); if (v != null) return v; } } catch (e) {}
       try { return localStorage.getItem(key); } catch (e) { return null; }
     },
     set(key, value) {
-      try { if (ready && sdk().data) sdk().data.setItem(key, value); } catch (e) {}
+      try { if (cgReady && cg().data) cg().data.setItem(key, value); } catch (e) {}
       try { localStorage.setItem(key, value); } catch (e) {}
     },
     remove(key) {
-      try { if (ready && sdk().data) sdk().data.removeItem(key); } catch (e) {}
+      try { if (cgReady && cg().data) cg().data.removeItem(key); } catch (e) {}
       try { localStorage.removeItem(key); } catch (e) {}
     },
 
-    /* Pede um ad ao portal. Durante o ad: muta o áudio e pausa o jogo;
-       restaura no fim/erro. onDone(true=sucesso|false=erro) sempre é chamado.
-       Sem SDK: chama onDone(true) na hora (dev local segue jogável). */
+    /* Pede um ad ao portal ativo. type: 'rewarded' (revive) vira rewardedBreak
+       no Poki; qualquer outro tipo ('midgame' etc.) vira commercialBreak.
+       Durante o ad: muta o áudio e pausa o jogo; restaura no fim/erro.
+       onDone(true=sucesso/assistiu|false=erro/recusado) sempre é chamado.
+       Sem nenhum SDK: chama onDone(true) na hora (dev local segue jogável). */
     requestAd(type, onDone) {
       const finish = ok => {
         if (adActive) { adActive = false; soundMuted = _preAdMuted; }
         if (onDone) onDone(ok);
       };
-      if (!ready) { if (onDone) onDone(true); return; }   // fora do portal: segue
-      try {
-        console.log('[CG] requestAd:', type);
-        sdk().ad.requestAd(type, {
-          adStarted:  () => { console.log('[CG] adStarted:', type); adActive = true; _preAdMuted = soundMuted; soundMuted = true; if (game) game.paused = true; },
-          adFinished: () => { console.log('[CG] adFinished:', type); finish(true); },
-          adError:    (e) => { console.warn('[CG] adError:', type, e); finish(false); },
-        });
-      } catch (e) { console.warn('[CG] requestAd threw:', type, e); finish(false); }
+      const onAdStarted = () => { adActive = true; _preAdMuted = soundMuted; soundMuted = true; if (game) game.paused = true; };
+      if (cgReady) {
+        try {
+          console.log('[PORTAL] requestAd (CrazyGames):', type);
+          cg().ad.requestAd(type, {
+            adStarted:  () => { console.log('[PORTAL] adStarted:', type); onAdStarted(); },
+            adFinished: () => { console.log('[PORTAL] adFinished:', type); finish(true); },
+            adError:    (e) => { console.warn('[PORTAL] adError:', type, e); finish(false); },
+          });
+        } catch (e) { console.warn('[PORTAL] requestAd threw:', type, e); finish(false); }
+        return;
+      }
+      if (pokiReady) {
+        try {
+          console.log('[PORTAL] requestAd (Poki):', type);
+          const p = type === 'rewarded' ? poki().rewardedBreak(onAdStarted) : poki().commercialBreak(onAdStarted);
+          p.then(result => { console.log('[PORTAL] adFinished (Poki):', type); finish(type === 'rewarded' ? !!result : true); })
+           .catch(e => { console.warn('[PORTAL] adError (Poki):', type, e); finish(false); });
+        } catch (e) { console.warn('[PORTAL] requestAd (Poki) threw:', type, e); finish(false); }
+        return;
+      }
+      if (onDone) onDone(true);   // fora de qualquer portal: segue
     },
 
     /* Envia o score ao leaderboard do CrazyGames. Exige a Encryption Key gerada
        no painel ao criar o leaderboard (cole em LEADERBOARD_KEY). Sem chave ou
-       sem SDK, vira no-op — o jogo segue normal fora do portal. */
+       sem SDK, vira no-op — o jogo segue normal fora do portal.
+       (Recurso específico do CrazyGames; o Poki não tem leaderboard via SDK.) */
     async submitScore(score) {
-      if (!ready || !LEADERBOARD_KEY) return;
+      if (!cgReady || !LEADERBOARD_KEY) return;
       try {
         const encryptedScore = await encryptScore(score, LEADERBOARD_KEY);
-        sdk().user.submitScore({ encryptedScore, score });
+        cg().user.submitScore({ encryptedScore, score });
       } catch (e) { console.warn('submitScore falhou', e); }
     },
   };
@@ -271,7 +298,7 @@ let META = { coins: 0, up: {} };
 let metaLoaded = false;   // true quando lemos dados REAIS do storage (ou mutamos em memória)
 function metaLoad() {
   let data = null;
-  try { data = JSON.parse(CG.get(META_KEY) || 'null'); } catch (e) { data = null; }
+  try { data = JSON.parse(PORTAL.get(META_KEY) || 'null'); } catch (e) { data = null; }
   if (data && typeof data.coins === 'number') {
     META = data;
     if (!META.up) META.up = {};
@@ -284,7 +311,7 @@ function metaLoad() {
    após init), tenta de novo quando o menu aparece — sem clobber, porque só
    re-lê enquanto NÃO temos dados reais nem mudanças em memória. */
 function ensureMeta() { if (!metaLoaded) metaLoad(); }
-function metaSave() { try { CG.set(META_KEY, JSON.stringify(META)); } catch (e) {} }
+function metaSave() { try { PORTAL.set(META_KEY, JSON.stringify(META)); } catch (e) {} }
 function upLvl(wid, tr) { return (META.up[wid] && META.up[wid][tr]) || 0; }
 function upCost(tr, lvl) { const d = WUP[tr]; return lvl < d.max ? d.cost[lvl] : null; }
 function buyUpgrade(wid, tr) {
@@ -390,7 +417,7 @@ const I18N = {
 };
 let LANG = 'en';
 function detectLang() {
-  const saved = CG.get('ss_lang');
+  const saved = PORTAL.get('ss_lang');
   if (saved && I18N[saved]) return saved;         // escolha manual tem prioridade
   let loc = '';
   try { loc = (window.CrazyGames && CrazyGames.SDK && CrazyGames.SDK.user &&
@@ -420,7 +447,7 @@ function applyStaticI18n() {
 function setLang(code) {
   if (!I18N[code]) return;
   LANG = code;
-  CG.set('ss_lang', code);
+  PORTAL.set('ss_lang', code);
   localizeDefs();
   applyStaticI18n();
   if (typeof rebuildMenuGrid === 'function') rebuildMenuGrid();
@@ -874,7 +901,7 @@ function showLevelUp() {
     pendingLevelUps = Math.max(0, pendingLevelUps - 1);
     if (pendingLevelUps > 0) { showLevelUp(); return; }
     game.paused = false;
-    CG.gameplayStart();
+    PORTAL.gameplayStart();
     return;
   }
   game.paused = true;
@@ -896,7 +923,7 @@ function showLevelUp() {
     box.appendChild(el);
   });
   document.getElementById('ui-levelup').classList.add('show');
-  CG.gameplayStop();   // menu de recompensa = pausa de gameplay
+  PORTAL.gameplayStop();   // menu de recompensa = pausa de gameplay
   beep(660, 0.08, 'square', 0.05);
 }
 function applyReward(c) {
@@ -915,7 +942,7 @@ function closeLevelUp() {
   document.getElementById('ui-levelup').classList.remove('show');
   pendingLevelUps--;
   if (pendingLevelUps > 0) showLevelUp();
-  else { game.paused = false; CG.gameplayStart(); }
+  else { game.paused = false; PORTAL.gameplayStart(); }
 }
 
 /* ----------------------------------------------------------------- update -- */
@@ -1311,13 +1338,13 @@ function overchargeBlast() {
 function gameOver() {
   const p = game.player; p.dead = true; p.deathAnim = 0;
   game.over = true; game.paused = true;
-  CG.gameplayStop();
+  PORTAL.gameplayStop();
   const min = Math.floor(game.t / 60), sec = Math.floor(game.t % 60);
   const score = calcScore();
-  const best = JSON.parse(CG.get('ss_best') || '{}');
+  const best = JSON.parse(PORTAL.get('ss_best') || '{}');
   const isNewBest = score > (best.score || 0);
-  if (isNewBest) CG.happytime();   // portal celebra o novo recorde
-  CG.submitScore(score);           // envia ao leaderboard global (se configurado)
+  if (isNewBest) PORTAL.happytime();   // portal celebra o novo recorde
+  PORTAL.submitScore(score);           // envia ao leaderboard global (se configurado)
   const earned = coinsForScore(score);  // valor potencial (só credita quando a run termina)
   const prevScore = best.score || 0;
   const recordBanner = isNewBest
@@ -1338,11 +1365,12 @@ function gameOver() {
   setTimeout(() => document.getElementById('ui-gameover').classList.add('show'), 600);
 }
 function revive() {
-  // rewarded ad do CrazyGames; concede o revive ao terminar. Em erro de anúncio
-  // (adblock/sem preenchimento) também concede — o revive já é limitado a 1/partida.
+  // rewarded ad do portal (CrazyGames ou Poki); concede o revive ao terminar. Em
+  // erro de anúncio (adblock/sem preenchimento) também concede — o revive já é
+  // limitado a 1/partida.
   const btn = document.getElementById('btnRevive');
   if (btn) btn.style.pointerEvents = 'none';   // evita duplo toque durante o ad
-  CG.requestAd('rewarded', () => { doRevive(); if (btn) btn.style.pointerEvents = ''; });
+  PORTAL.requestAd('rewarded', () => { doRevive(); if (btn) btn.style.pointerEvents = ''; });
 }
 function doRevive() {
   game.revives++;
@@ -1356,7 +1384,7 @@ function doRevive() {
     if (dx * dx + dy * dy < 170 * 170 && !e.dying) damageEnemy(e, 9999);
   }
   document.getElementById('ui-gameover').classList.remove('show');
-  CG.gameplayStart();   // voltou a jogar
+  PORTAL.gameplayStart();   // voltou a jogar
 }
 
 /* ------------------------------------------------------------------ render -- */
@@ -2626,19 +2654,19 @@ function pauseGame() {
   if (!game || !game.running || game.over) return;
   if (document.getElementById('ui-levelup').classList.contains('show')) return;
   game.paused = true;
-  CG.gameplayStop();
+  PORTAL.gameplayStop();
   document.getElementById('ui-pause').classList.add('show');
 }
 function resumeGame() {
   document.getElementById('ui-pause').classList.remove('show');
   game.paused = false;
-  CG.gameplayStart();
+  PORTAL.gameplayStart();
 }
 function goMainMenu() {
   document.getElementById('ui-gameover').classList.remove('show');
   document.getElementById('ui-pause').classList.remove('show');
   if (game) { game.running = false; game.paused = false; }
-  CG.gameplayStop();
+  PORTAL.gameplayStop();
   _menuMode = 'start';
   document.getElementById('btnStart').innerHTML = '&#9654;&ensp;JOGAR';
   updateMenuStats();
@@ -2647,12 +2675,12 @@ function goMainMenu() {
   _animMenuIn();
 }
 function start() {
-  _animMenuOut(() => { newGame(_lockedWeaponId); game.running = true; CG.gameplayStart(); });
+  _animMenuOut(() => { newGame(_lockedWeaponId); game.running = true; PORTAL.gameplayStart(); });
 }
 
 function updateMenuStats() {
   ensureMeta();   // re-tenta carregar a sucata se o boot leu vazio (SDK.data tardio)
-  const best = JSON.parse(CG.get('ss_best') || '{}');
+  const best = JSON.parse(PORTAL.get('ss_best') || '{}');
   const t = best.time || 0;
   const m = String(Math.floor(t / 60)).padStart(2, '0');
   const s = String(Math.floor(t % 60)).padStart(2, '0');
@@ -2667,13 +2695,13 @@ function updateMenuStats() {
 }
 
 function saveBestStats() {
-  const best = JSON.parse(CG.get('ss_best') || '{}');
+  const best = JSON.parse(PORTAL.get('ss_best') || '{}');
   if (game.t > (best.time || 0)) best.time = game.t;
   if (game.level > (best.level || 1)) best.level = game.level;
   if (game.player.maxhp > (best.maxhp || 100)) best.maxhp = game.player.maxhp;
   const score = calcScore();
   if (score > (best.score || 0)) best.score = score;
-  CG.set('ss_best', JSON.stringify(best));
+  PORTAL.set('ss_best', JSON.stringify(best));
 }
 
 let _spiderRAF = null;
@@ -2908,8 +2936,8 @@ function renderUpgrades(id) {
 }
 
 (async () => {
-  await CG.init();          // inicializa o SDK (no-op fora do portal)
-  CG.initMute(m => {
+  await PORTAL.init();          // inicializa o SDK (no-op fora do portal)
+  PORTAL.initMute(m => {
     portalMuted = m;
     // para/retoma música do menu quando o portal muda o mute
     try {
@@ -2928,7 +2956,7 @@ function renderUpgrades(id) {
   metaLoad();               // sucata + upgrades permanentes (localStorage)
   localizeDefs();           // nomes+descrições de armas/passivas no idioma atual
   applyStaticI18n();        // textos estáticos do HTML (menu, pause, game-over)
-  CG.loadingStart();        // avisa o portal que o carregamento começou
+  PORTAL.loadingStart();        // avisa o portal que o carregamento começou
   loadAll(() => {
     measureSprites();
     const logoEl = document.getElementById('logoImg');
@@ -2940,7 +2968,7 @@ function renderUpgrades(id) {
     updateMenuStats();
     newGame();
     initSpiderCanvas();
-    CG.loadingStop();       // carregamento concluído — portal esconde o loader
+    PORTAL.loadingStop();       // carregamento concluído — portal esconde o loader
     hideBootScreen();       // esconde nossa tela de loading (standalone/ngrok)
     startMenuMusic();       // música de fundo do menu
     requestAnimationFrame(loop);
@@ -2960,7 +2988,7 @@ document.getElementById('btnRestart').onclick    = () => {
   document.getElementById('ui-gameover').classList.remove('show');
   // midgame ad na virada de partida (pausa natural); o portal já limita a
   // frequência, então não há risco de spam. Segue pro menu ao fim/erro.
-  CG.requestAd('midgame', () => goMainMenu());
+  PORTAL.requestAd('midgame', () => goMainMenu());
 };
 document.getElementById('btnRevive').onclick = revive;
 

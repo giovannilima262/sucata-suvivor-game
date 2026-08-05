@@ -48,13 +48,17 @@ python3 -m http.server 8753
 O jogo já está estruturado pro modelo que **mais converte sem orçamento de marketing**:
 publicar em **CrazyGames / Poki** com rev-share de anúncios.
 
-- `revive()` em `game.js` → onde entra o **rewarded ad** (CrazyGames/Poki SDK). Hoje dá 1 revive grátis.
+- SDKs da **CrazyGames** e **Poki** já integrados em `game.js` via o wrapper `PORTAL`
+  (detecta qual dos dois está presente no host; sem nenhum, tudo vira no-op e o jogo
+  roda normal em dev local). Cobre `init`, loading, `gameplayStart/Stop`,
+  `commercialBreak`/`rewardedBreak` (Poki) e `ad.requestAd` (CrazyGames).
+- `revive()` em `game.js` → dispara o **rewarded ad** do portal ativo. Hoje dá 1 revive grátis.
+- "Recomeçar" na tela de game over → dispara um ad comercial (`midgame`) antes de voltar ao menu.
 - Sessões longas (survivor) = mais ad breaks = mais receita de rev-share.
 - Wrap mobile depois (mesmo HTML em Capacitor) pra Play Store.
 
 ## Próximos passos sugeridos
 
-- [ ] Integrar SDK do CrazyGames/Poki nos pontos de anúncio (revive, e ad no "recomeçar").
 - [ ] Boss a cada 2 min (sprite de inimigo escalado).
 - [ ] Mais armas das 9 do kit (escudo orbital, martelo melee, granada).
 - [ ] Altar do kit como "loja" entre ondas.
